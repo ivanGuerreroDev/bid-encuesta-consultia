@@ -6,147 +6,162 @@ from office365.runtime.auth.user_credential import UserCredential
 from io import BytesIO
 import os
 from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor
-import numpy as np
+import tempfile
 
 load_dotenv()
 app = Flask(__name__)
 
-def download_sharepoint_file(ctx, url, filename):
-    """Helper function to download files from SharePoint"""
-    with open(filename, "wb") as file:
-        ctx.web.get_file_by_server_relative_url(url).download(file).execute_query()
+def download_sharepoint_file(ctx, url, temp_dir):
+    """Helper function to download files from SharePoint using temporary files"""
+    try:
+        file_name = url.split('/')[-1]
+        temp_path = os.path.join(temp_dir, file_name)
+        
+        file_obj = ctx.web.get_file_by_server_relative_url(url)
+        ctx.load(file_obj)
+        ctx.execute_query()
+        
+        with open(temp_path, 'wb') as local_file:
+            file_response = file_obj.download(local_file)
+            ctx.execute_query()
+            
+        return temp_path
+        
+    except Exception as e:
+        print(f"Error downloading file from {url}: {str(e)}")
+        raise
 
 def process_empresa_data(df_encuesta):
     """Process company data efficiently using vectorized operations"""
     empresas = {}
     
-    # Extraer códigos de preguntas una sola vez
-    df_encuesta['pregunta_code'] = df_encuesta.columns.map(
-        lambda x: re.search(r"\[([A-Za-z0-9_.]+)\]", str(x)).group(1) if isinstance(x, str) and re.search(r"\[([A-Za-z0-9_.]+)\]", str(x)) else ""
-    )
-    
-    # Extraer códigos de respuestas una sola vez
-    df_encuesta['respuesta_code'] = df_encuesta.apply(
-        lambda x: re.search(r"\[([A-Za-z0-9_.]+)\]", str(x)).group(1) if isinstance(x, str) and re.search(r"\[([A-Za-z0-9_.]+)\]", str(x)) else "",
-        axis=1
-    )
-    
     for _, row in df_encuesta.iterrows():
         id_empresa = row['ID']
         if id_empresa not in empresas:
-            empresas[id_empresa] = {}
+            empresas[id_empresa] = {'Empresa': '', 'Pais': ''}
             
-        # Asignar empresa
-        mask_pg001 = row['pregunta_code'] == "Pg001"
-        if any(mask_pg001):
-            empresas[id_empresa]['Empresa'] = row[mask_pg001].iloc[0]
-            
-        # Asignar país
-        if "Pg011.01" in row['respuesta_code'].values:
-            empresas[id_empresa]['Pais'] = 'Costa Rica'
-        elif "Pg011.02" in row['respuesta_code'].values:
-            empresas[id_empresa]['Pais'] = 'Panamá'
+        for columna, valor in row.items():
+            if isinstance(columna, str) and isinstance(valor, str):
+                # Buscar código de pregunta para empresa
+                if '[Pg001]' in columna:
+                    empresas[id_empresa]['Empresa'] = valor
+                # Buscar códigos de respuesta para país
+                if '[Pg011.01]' in valor:
+                    empresas[id_empresa]['Pais'] = 'Costa Rica'
+                elif '[Pg011.02]' in valor:
+                    empresas[id_empresa]['Pais'] = 'Panamá'
             
     return empresas
 
 @app.route('/generate-excel', methods=['GET'])
 def generate_excel():
-    try:
-        # Configuración de conexión a SharePoint
-        sharepoint_site = "https://marketingconsultia.sharepoint.com/sites/BIDCiberseguridad"
-        sharepoint_urls = {
-            'encuesta': "/sites/BIDCiberseguridad/Documentos%20compartidos/Encuesta sobre brechas digitales en ciberseguridad en PYMEs.xlsx",
-            'puntajes': "/sites/BIDCiberseguridad/Documentos%20compartidos/puntajes.xlsx"
-        }
-        
-        # Conectar a SharePoint
-        ctx = ClientContext(sharepoint_site).with_credentials(
-            UserCredential(os.getenv("SHAREPOINT_USER"), os.getenv("SHAREPOINT_PASSWORD"))
-        )
-        
-        # Descargar archivos en paralelo
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                executor.submit(download_sharepoint_file, ctx, sharepoint_urls['encuesta'], "df_encuesta.xlsx"): 'encuesta',
-                executor.submit(download_sharepoint_file, ctx, sharepoint_urls['puntajes'], "df_puntajes.xlsx"): 'puntajes'
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            # Configuración de conexión a SharePoint
+            sharepoint_site = "https://marketingconsultia.sharepoint.com/sites/BIDCiberseguridad"
+            sharepoint_urls = {
+                'encuesta': "/sites/BIDCiberseguridad/Documentos%20compartidos/Encuesta sobre brechas digitales en ciberseguridad en PYMEs.xlsx",
+                'puntajes': "/sites/BIDCiberseguridad/Documentos%20compartidos/puntajes.xlsx"
             }
-        
-        # Cargar DataFrames
-        df_encuesta = pd.read_excel("df_encuesta.xlsx", sheet_name="Form1")
-        df_puntajes = pd.read_excel("df_puntajes.xlsx")
-        df_puntajes.columns = df_puntajes.columns.str.strip()
-        
-        # Procesar datos de empresas
-        empresas = process_empresa_data(df_encuesta)
-        
-        # Calcular secciones_puntaje usando groupby
-        secciones_puntaje = df_puntajes.groupby('Seccion')['Puntaje'].sum().to_dict()
-        
-        # Preparar resultados usando vectorización
-        resultados = []
-        for index, row in df_encuesta.iterrows():
-            empresa_data = empresas.get(row['ID'], {})
-            if not isinstance(empresa_data, dict) or 'Empresa' not in empresa_data:
-                continue
+            
+            ctx = ClientContext(sharepoint_site).with_credentials(
+                UserCredential(os.getenv("SHAREPOINT_USER"), os.getenv("SHAREPOINT_PASSWORD"))
+            )
+            
+            try:
+                encuesta_path = download_sharepoint_file(ctx, sharepoint_urls['encuesta'], temp_dir)
+                puntajes_path = download_sharepoint_file(ctx, sharepoint_urls['puntajes'], temp_dir)
+            except Exception as e:
+                print(f"Error en la descarga de archivos: {str(e)}")
+                raise
+            
+            try:
+                df_encuesta = pd.read_excel(encuesta_path, sheet_name="Form1", engine='openpyxl')
+                df_puntajes = pd.read_excel(puntajes_path, engine='openpyxl')
+            except Exception as e:
+                print(f"Error leyendo archivos Excel: {str(e)}")
+                raise
                 
-            for pregunta in df_encuesta.columns:
-                respuesta = row[pregunta]
-                if not isinstance(respuesta, str):
+            df_puntajes.columns = df_puntajes.columns.str.strip()
+            
+            # Procesar datos de empresas
+            empresas = process_empresa_data(df_encuesta)
+            
+            # Calcular secciones_puntaje usando groupby
+            secciones_puntaje = df_puntajes.groupby('Seccion')['Puntaje'].sum().to_dict()
+            
+            # Preparar resultados
+            resultados = []
+            
+            # Procesar cada respuesta de la encuesta
+            for _, row_encuesta in df_encuesta.iterrows():
+                id_empresa = row_encuesta['ID']
+                empresa_info = empresas.get(id_empresa, {})
+                
+                if not empresa_info.get('Empresa'):
                     continue
-                    
-                respuesta_code = re.search(r"\[([A-Za-z0-9_.]+)\]", respuesta)
-                if not respuesta_code:
-                    continue
-                    
-                respuesta_code = respuesta_code.group(1)
                 
-                # Buscar puntaje eficientemente
-                puntaje_match = df_puntajes[
-                    (df_puntajes['Respuesta Pequeña'] == respuesta_code) |
-                    (df_puntajes['Respuesta Mediana'] == respuesta_code)
-                ]
+                # Procesar cada respuesta de la fila
+                for columna, respuesta in row_encuesta.items():
+                    if not isinstance(respuesta, str):
+                        continue
+                        
+                    respuesta_match = re.search(r"\[([A-Za-z0-9_.]+)\]", str(respuesta))
+                    if not respuesta_match:
+                        continue
+                        
+                    respuesta_code = respuesta_match.group(1)
+                    
+                    # Buscar en df_puntajes
+                    puntaje_match = df_puntajes[
+                        (df_puntajes['Respuesta Pequeña'] == respuesta_code) |
+                        (df_puntajes['Respuesta Mediana'] == respuesta_code)
+                    ]
+                    
+                    if not puntaje_match.empty:
+                        tamano = 'Pequeña' if respuesta_code == puntaje_match['Respuesta Pequeña'].iloc[0] else 'Mediana'
+                        seccion = puntaje_match['Seccion'].iloc[0]
+                        
+                        resultados.append({
+                            'ID': id_empresa,
+                            'Empresa': empresa_info.get('Empresa', ''),
+                            'Tamaño': tamano,
+                            'Pais': empresa_info.get('Pais', ''),
+                            'Puntaje': float(puntaje_match['Puntaje'].iloc[0]),
+                            'Seccion': seccion,
+                            'Puntaje Seccion': secciones_puntaje[seccion]
+                        })
+            
+            # Crear DataFrame y agrupar resultados
+            if not resultados:
+                raise ValueError("No se encontraron resultados para procesar")
                 
-                if not puntaje_match.empty:
-                    resultados.append({
-                        'ID': row['ID'],
-                        'Empresa': empresa_data['Empresa'],
-                        'Tamaño': 'Pequeña' if respuesta_code == puntaje_match['Respuesta Pequeña'].iloc[0] else 'Mediana',
-                        'Pais': empresa_data.get('Pais', ''),
-                        'Puntaje': puntaje_match['Puntaje'].iloc[0],
-                        'Seccion': puntaje_match['Seccion'].iloc[0],
-                        'Puntaje Seccion': secciones_puntaje[puntaje_match['Seccion'].iloc[0]]
-                    })
-        
-        # Crear DataFrame final y agrupar resultados
-        df_resultados = pd.DataFrame(resultados)
-        df_resultados['Puntaje'] = pd.to_numeric(df_resultados['Puntaje'], errors='coerce')
-        df_resultados_agrupados = df_resultados.groupby(
-            ['ID', 'Empresa', 'Tamaño', 'Pais', 'Seccion'],
-            as_index=False
-        )['Puntaje'].sum()
-        
-        # Agregar Puntaje Seccion
-        df_resultados_agrupados['Puntaje Seccion'] = df_resultados_agrupados['Seccion'].map(secciones_puntaje)
-        
-        # Guardar y subir resultado
-        output = BytesIO()
-        df_resultados_agrupados.to_excel(output, index=False, engine='openpyxl')
-        
-        # Subir archivo a SharePoint
-        ctx.web.get_folder_by_server_relative_url("/sites/BIDCiberseguridad/Documentos%20compartidos") \
-           .upload_file("tabla_radar.xlsx", output.getvalue()) \
-           .execute_query()
-        
-        # Limpiar archivos temporales
-        for filename in ["df_encuesta.xlsx", "df_puntajes.xlsx"]:
-            if os.path.exists(filename):
-                os.remove(filename)
-        
-        return jsonify({"message": "Excel generado correctamente"}), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            df_resultados = pd.DataFrame(resultados)
+            
+            # Agrupar resultados por las columnas necesarias y sumar puntajes
+            df_resultados_agrupados = df_resultados.groupby(
+                ['ID', 'Empresa', 'Tamaño', 'Pais', 'Seccion'],
+                as_index=False
+            ).agg({
+                'Puntaje': 'sum',
+                'Puntaje Seccion': 'first'  # Tomamos el primer valor ya que es el mismo para cada sección
+            })
+            
+            # Guardar resultado en memoria
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_resultados_agrupados.to_excel(writer, index=False)
+            
+            output.seek(0)
+            
+            # Subir archivo a SharePoint
+            folder = ctx.web.get_folder_by_server_relative_url("/sites/BIDCiberseguridad/Documentos%20compartidos")
+            folder.upload_file("tabla_radar.xlsx", output.getvalue()).execute_query()
+            
+            return jsonify({"message": "Excel generado correctamente"}), 200
+            
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)

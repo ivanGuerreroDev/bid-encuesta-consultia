@@ -1,168 +1,152 @@
 import pandas as pd
 import re
-from flask import Flask, jsonify, send_file, Response
+from flask import Flask, jsonify
 from office365.sharepoint.client_context import ClientContext
 from office365.runtime.auth.user_credential import UserCredential
 from io import BytesIO
 import os
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+
 load_dotenv()
 app = Flask(__name__)
+
+def download_sharepoint_file(ctx, url, filename):
+    """Helper function to download files from SharePoint"""
+    with open(filename, "wb") as file:
+        ctx.web.get_file_by_server_relative_url(url).download(file).execute_query()
+
+def process_empresa_data(df_encuesta):
+    """Process company data efficiently using vectorized operations"""
+    empresas = {}
+    
+    # Extraer códigos de preguntas una sola vez
+    df_encuesta['pregunta_code'] = df_encuesta.columns.map(
+        lambda x: re.search(r"\[([A-Za-z0-9_.]+)\]", str(x)).group(1) if isinstance(x, str) and re.search(r"\[([A-Za-z0-9_.]+)\]", str(x)) else ""
+    )
+    
+    # Extraer códigos de respuestas una sola vez
+    df_encuesta['respuesta_code'] = df_encuesta.apply(
+        lambda x: re.search(r"\[([A-Za-z0-9_.]+)\]", str(x)).group(1) if isinstance(x, str) and re.search(r"\[([A-Za-z0-9_.]+)\]", str(x)) else "",
+        axis=1
+    )
+    
+    for _, row in df_encuesta.iterrows():
+        id_empresa = row['ID']
+        if id_empresa not in empresas:
+            empresas[id_empresa] = {}
+            
+        # Asignar empresa
+        mask_pg001 = row['pregunta_code'] == "Pg001"
+        if any(mask_pg001):
+            empresas[id_empresa]['Empresa'] = row[mask_pg001].iloc[0]
+            
+        # Asignar país
+        if "Pg011.01" in row['respuesta_code'].values:
+            empresas[id_empresa]['Pais'] = 'Costa Rica'
+        elif "Pg011.02" in row['respuesta_code'].values:
+            empresas[id_empresa]['Pais'] = 'Panamá'
+            
+    return empresas
 
 @app.route('/generate-excel', methods=['GET'])
 def generate_excel():
     try:
         # Configuración de conexión a SharePoint
         sharepoint_site = "https://marketingconsultia.sharepoint.com/sites/BIDCiberseguridad"
-        sharepoint_url_encuesta = "/sites/BIDCiberseguridad/Documentos%20compartidos/Encuesta sobre brechas digitales en ciberseguridad en PYMEs.xlsx"
-        sharepoint_url_puntajes = "/sites/BIDCiberseguridad/Documentos%20compartidos/puntajes.xlsx"
-        username =  os.getenv("SHAREPOINT_USER")
-        password = os.getenv("SHAREPOINT_PASSWORD")
+        sharepoint_urls = {
+            'encuesta': "/sites/BIDCiberseguridad/Documentos%20compartidos/Encuesta sobre brechas digitales en ciberseguridad en PYMEs.xlsx",
+            'puntajes': "/sites/BIDCiberseguridad/Documentos%20compartidos/puntajes.xlsx"
+        }
+        
         # Conectar a SharePoint
-        ctx = ClientContext(sharepoint_site).with_credentials(UserCredential(username, password))
-        #print folders of site
-        web = ctx.web
-        folderDocumentosCompartidos = web.get_folder_by_server_relative_url("/sites/BIDCiberseguridad/Documentos%20compartidos")
-        # get file encuesta
-        file_encuesta = web.get_file_by_server_relative_url(sharepoint_url_encuesta)
-        if not file_encuesta.execute_query():
-            print("File 'df_encuesta.xlsx' not found in SharePoint.")
-            exit()
-
-        # get file puntajes
-        file_puntajes = web.get_file_by_server_relative_url(sharepoint_url_puntajes)
-        if not file_puntajes.execute_query():
-            print("File 'df_puntajes.xlsx' not found in SharePoint.")
-            exit()
-
-            
-        # Descargar df_encuesta
-        with open("df_encuesta.xlsx", "wb") as file_encuesta:
-            response_encuesta = ctx.web.get_file_by_server_relative_url(sharepoint_url_encuesta).download(file_encuesta).execute_query()
-
-        # Descargar df_puntajes
-        with open("df_puntajes.xlsx", "wb") as file_puntajes:
-            response_puntajes = ctx.web.get_file_by_server_relative_url(sharepoint_url_puntajes).download(file_puntajes).execute_query()
-
-        # Cargar los archivos descargados como DataFrames
+        ctx = ClientContext(sharepoint_site).with_credentials(
+            UserCredential(os.getenv("SHAREPOINT_USER"), os.getenv("SHAREPOINT_PASSWORD"))
+        )
+        
+        # Descargar archivos en paralelo
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = {
+                executor.submit(download_sharepoint_file, ctx, sharepoint_urls['encuesta'], "df_encuesta.xlsx"): 'encuesta',
+                executor.submit(download_sharepoint_file, ctx, sharepoint_urls['puntajes'], "df_puntajes.xlsx"): 'puntajes'
+            }
+        
+        # Cargar DataFrames
         df_encuesta = pd.read_excel("df_encuesta.xlsx", sheet_name="Form1")
         df_puntajes = pd.read_excel("df_puntajes.xlsx")
-
-        # Limpiar nombres de columnas para evitar problemas
         df_puntajes.columns = df_puntajes.columns.str.strip()
-
-        # Crear una lista para almacenar los resultados
+        
+        # Procesar datos de empresas
+        empresas = process_empresa_data(df_encuesta)
+        
+        # Calcular secciones_puntaje usando groupby
+        secciones_puntaje = df_puntajes.groupby('Seccion')['Puntaje'].sum().to_dict()
+        
+        # Preparar resultados usando vectorización
         resultados = []
-        empresas = {}
-        secciones_puntaje = {}
-
-        # Obtener nombre de la empresa
         for index, row in df_encuesta.iterrows():
+            empresa_data = empresas.get(row['ID'], {})
+            if not isinstance(empresa_data, dict) or 'Empresa' not in empresa_data:
+                continue
+                
             for pregunta in df_encuesta.columns:
-                respuesta =  row[pregunta]
+                respuesta = row[pregunta]
+                if not isinstance(respuesta, str):
+                    continue
+                    
+                respuesta_code = re.search(r"\[([A-Za-z0-9_.]+)\]", respuesta)
+                if not respuesta_code:
+                    continue
+                    
+                respuesta_code = respuesta_code.group(1)
                 
-                if isinstance(pregunta, str):
-                    current_pregunta_code = re.search(r"\[([A-Za-z0-9_.]+)\]", pregunta)
-                    pregunta_code = current_pregunta_code.group(1) if current_pregunta_code else ""
-                else:
-                    pregunta_code = ""
-                if isinstance(respuesta, str):
-                    current_respuesta_code = re.search(r"\[([A-Za-z0-9_.]+)\]", respuesta)
-                    respuesta_code = current_respuesta_code.group(1) if current_respuesta_code else ""
-                else:
-                    respuesta_code = ""
-                if( row['ID'] not in empresas):
-                    empresas[row['ID']] = {}
-                if pregunta_code == "Pg001":
-                    empresas[row['ID']]['Empresa'] = respuesta
-                if respuesta_code == "Pg011.01":
-                    empresas[row['ID']]['Pais'] = 'Costa Rica'
-                if respuesta_code == "Pg011.02":
-                    empresas[row['ID']]['Pais'] = 'Panamá'
-
-        # Sumar puntajes por secciones
-        for index, row in df_puntajes.iterrows():
-            if row['Seccion'] not in secciones_puntaje:
-                secciones_puntaje[row['Seccion']] = 0
-            secciones_puntaje[row['Seccion']] += row['Puntaje']
-
-        df_empresas = pd.DataFrame(empresas.items(), columns=['ID', 'Empresa'])
-
-        # Iterar sobre cada fila en el DataFrame de Encuesta
-        for index, row in df_encuesta.iterrows():
-            for pregunta in df_encuesta.columns:
-                current_id = row['ID']
-                current_respuesta = row[pregunta]
+                # Buscar puntaje eficientemente
+                puntaje_match = df_puntajes[
+                    (df_puntajes['Respuesta Pequeña'] == respuesta_code) |
+                    (df_puntajes['Respuesta Mediana'] == respuesta_code)
+                ]
                 
-                # Asegurarse de que current_respuesta es una cadena
-                if isinstance(current_respuesta, str):
-                    current_respuesta_code = re.search(r"\[([A-Za-z0-9_.]+)\]", current_respuesta)
-                    respuesta_code = current_respuesta_code.group(1) if current_respuesta_code else ""
-                else:
-                    respuesta_code = ""
-
-                # Calcular el puntaje correspondiente
-                puntaje_fila = 0
-                seccion = ''
-                tamano = ''
-                for index_puntaje, row_puntaje in df_puntajes.iterrows():
-                    if (row_puntaje['Respuesta Pequeña'] == respuesta_code or 
-                        row_puntaje['Respuesta Mediana'] == respuesta_code):
-                        puntaje_fila = row_puntaje['Puntaje']
-                        seccion = row_puntaje['Seccion']
-                        if row_puntaje['Respuesta Pequeña'] == respuesta_code:
-                            tamano = 'Pequeña'
-                        if row_puntaje['Respuesta Mediana'] == respuesta_code:
-                            tamano = 'Mediana'
-                        break
-
-                # Almacenar solo ID, Empresa y Puntaje en la lista
-                empresa_data = empresas.get(current_id, {})
-                if isinstance(empresa_data, dict):
-                    nombre_empresa = empresa_data.get('Empresa', '')
-                else:
-                    nombre_empresa = empresa_data  # Si es una cadena, úsala directamente
-                
-                #get pais
-                pais = empresas[current_id].get('Pais', '')
-                if nombre_empresa != '' and seccion != '':
+                if not puntaje_match.empty:
                     resultados.append({
-                        'ID': current_id,
-                        'Empresa': nombre_empresa,
-                        'Tamaño': tamano,
-                        'Pais': pais,
-                        'Puntaje': puntaje_fila,
-                        'Seccion': seccion,
-                        'Puntaje Seccion': secciones_puntaje[seccion],
+                        'ID': row['ID'],
+                        'Empresa': empresa_data['Empresa'],
+                        'Tamaño': 'Pequeña' if respuesta_code == puntaje_match['Respuesta Pequeña'].iloc[0] else 'Mediana',
+                        'Pais': empresa_data.get('Pais', ''),
+                        'Puntaje': puntaje_match['Puntaje'].iloc[0],
+                        'Seccion': puntaje_match['Seccion'].iloc[0],
+                        'Puntaje Seccion': secciones_puntaje[puntaje_match['Seccion'].iloc[0]]
                     })
-        # Crear un nuevo DataFrame con los resultados
+        
+        # Crear DataFrame final y agrupar resultados
         df_resultados = pd.DataFrame(resultados)
-
-        # Asegurarse de que 'Puntaje' es numérico
         df_resultados['Puntaje'] = pd.to_numeric(df_resultados['Puntaje'], errors='coerce')
-
-        # Agrupar por ID y Seccion y sumar los puntajes
-        df_resultados_agrupados = df_resultados.groupby(['ID', 'Empresa', 'Tamaño', 'Pais', 'Seccion'], as_index=False)['Puntaje'].sum()
-
-        # Incrustar el puntaje de la sección
+        df_resultados_agrupados = df_resultados.groupby(
+            ['ID', 'Empresa', 'Tamaño', 'Pais', 'Seccion'],
+            as_index=False
+        )['Puntaje'].sum()
+        
+        # Agregar Puntaje Seccion
         df_resultados_agrupados['Puntaje Seccion'] = df_resultados_agrupados['Seccion'].map(secciones_puntaje)
-
-        # Crear un archivo Excel con los resultados
+        
+        # Guardar y subir resultado
         output = BytesIO()
         df_resultados_agrupados.to_excel(output, index=False, engine='openpyxl')
-        # guardar archivo excel resultado.xlsx 
-        #with open("tabla_radar.xlsx", "wb") as file_resultado:
-        #    file_resultado.write(output.getvalue())
-
-        # Subir el archivo Excel a SharePoint
-        folderDocumentosCompartidos.upload_file("tabla_radar.xlsx", output.getvalue()).execute_query()
         
-        # Eliminar los archivos locales
-        os.remove("df_encuesta.xlsx")
-        os.remove("df_puntajes.xlsx")
-        os.remove("tabla_radar.xlsx")
+        # Subir archivo a SharePoint
+        ctx.web.get_folder_by_server_relative_url("/sites/BIDCiberseguridad/Documentos%20compartidos") \
+           .upload_file("tabla_radar.xlsx", output.getvalue()) \
+           .execute_query()
+        
+        # Limpiar archivos temporales
+        for filename in ["df_encuesta.xlsx", "df_puntajes.xlsx"]:
+            if os.path.exists(filename):
+                os.remove(filename)
+        
         return jsonify({"message": "Excel generado correctamente"}), 200
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=80)

@@ -7,6 +7,7 @@ from io import BytesIO
 import os
 from dotenv import load_dotenv
 import tempfile
+from collections import defaultdict
 
 load_dotenv()
 app = Flask(__name__)
@@ -90,21 +91,14 @@ def generate_excel():
             # Calcular secciones_puntaje usando groupby
             secciones_puntaje = df_puntajes.groupby('Seccion')['Puntaje'].sum().to_dict()
             # Calcula puntaje por tamaño suma si la fila tiene valor en la columna Pregunta Pequeña o Pregunta Mediana.
-            secciones_puntaje_pequena = dict()
-            secciones_puntaje_mediana = dict()
+            secciones_puntaje_pequena = defaultdict(int)
+            secciones_puntaje_mediana = defaultdict(int)
+
             for _, row in df_puntajes.iterrows():
-                if row['Respuesta Pequeña']:
-                    if secciones_puntaje_pequena[row['Seccion']]:
-                        secciones_puntaje_pequena[row['Seccion']] += row['Puntaje']
-                    else:
-                        secciones_puntaje_pequena[row['Seccion']] = row['Puntaje']
-                if row['Respuesta Mediana']:
-                    if secciones_puntaje_mediana[row['Seccion']]:
-                        secciones_puntaje_mediana[row['Seccion']] += row['Puntaje']
-                    else:
-                        secciones_puntaje_mediana[row['Seccion']] = row['Puntaje']
-                        
-            
+                if row['Respuesta Pequeña'] and not pd.isna(row['Respuesta Pequeña']):
+                    secciones_puntaje_pequena[row['Seccion']] += row['Puntaje']
+                if row['Respuesta Mediana'] and not pd.isna(row['Respuesta Mediana']):
+                    secciones_puntaje_mediana[row['Seccion']] += row['Puntaje']
             # Preparar resultados
             resultados = []
             
@@ -179,4 +173,4 @@ def generate_excel():
             return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=80)
+    app.run(host='0.0.0.0', port=8090)

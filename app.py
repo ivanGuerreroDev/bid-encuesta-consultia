@@ -89,6 +89,21 @@ def generate_excel():
             
             # Calcular secciones_puntaje usando groupby
             secciones_puntaje = df_puntajes.groupby('Seccion')['Puntaje'].sum().to_dict()
+            # Calcula puntaje por tamaño suma si la fila tiene valor en la columna Pregunta Pequeña o Pregunta Mediana.
+            secciones_puntaje_pequena = dict()
+            secciones_puntaje_mediana = dict()
+            for _, row in df_puntajes.iterrows():
+                if row['Respuesta Pequeña']:
+                    if secciones_puntaje_pequena[row['Seccion']]:
+                        secciones_puntaje_pequena[row['Seccion']] += row['Puntaje']
+                    else:
+                        secciones_puntaje_pequena[row['Seccion']] = row['Puntaje']
+                if row['Respuesta Mediana']:
+                    if secciones_puntaje_mediana[row['Seccion']]:
+                        secciones_puntaje_mediana[row['Seccion']] += row['Puntaje']
+                    else:
+                        secciones_puntaje_mediana[row['Seccion']] = row['Puntaje']
+                        
             
             # Preparar resultados
             resultados = []
@@ -129,7 +144,7 @@ def generate_excel():
                             'Pais': empresa_info.get('Pais', ''),
                             'Puntaje': float(puntaje_match['Puntaje'].iloc[0]),
                             'Seccion': seccion,
-                            'Puntaje Seccion': secciones_puntaje[seccion]
+                            'Puntaje Seccion': secciones_puntaje_pequena[seccion] if tamano == 'Pequeña' else secciones_puntaje_mediana[seccion]
                         })
             
             # Crear DataFrame y agrupar resultados

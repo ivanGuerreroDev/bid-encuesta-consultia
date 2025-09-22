@@ -2,7 +2,7 @@ import pandas as pd
 import re
 from flask import Flask, jsonify
 from office365.sharepoint.client_context import ClientContext
-from office365.runtime.auth.user_credential import UserCredential
+from office365.runtime.auth.client_credential import ClientCredential
 from io import BytesIO
 import os
 from dotenv import load_dotenv
@@ -66,7 +66,7 @@ def generate_excel():
             }
             
             ctx = ClientContext(sharepoint_site).with_credentials(
-                UserCredential(os.getenv("SHAREPOINT_USER"), os.getenv("SHAREPOINT_PASSWORD"))
+                ClientCredential(os.getenv("CLIENT_ID"), os.getenv("CLIENT_SECRET"))
             )
             
             try:

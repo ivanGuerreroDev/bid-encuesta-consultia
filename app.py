@@ -58,15 +58,25 @@ def process_empresa_data(df_encuesta):
 def generate_excel():
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            # Configuración de conexión a SharePoint
-            sharepoint_site = "https://marketingconsultia.sharepoint.com/sites/BIDCiberseguridad"
+            # Configuración de conexión a SharePoint con tenant credentials
+            sharepoint_site = f"https://marketingconsultia.sharepoint.com/sites/BIDCiberseguridad"
             sharepoint_urls = {
-                'encuesta': "/sites/BIDCiberseguridad/Documentos%20compartidos/Encuesta sobre brechas digitales en ciberseguridad en PYMEs.xlsx",
-                'puntajes': "/sites/BIDCiberseguridad/Documentos%20compartidos/puntajes.xlsx"
+                'encuesta': "/sites/BIDCiberseguridad/Documentos compartidos/Encuesta sobre brechas digitales en ciberseguridad en PYMEs.xlsx",
+                'puntajes': "/sites/BIDCiberseguridad/Documentos compartidos/puntajes.xlsx"
             }
             
+            # Crear contexto con tenant credentials usando ClientCredential
+            tenant_id = os.getenv("TENANT_ID")
+            client_id = os.getenv("CLIENT_ID")
+            client_secret = os.getenv("CLIENT_SECRET")
+            
+            print(f"Debug - TENANT_ID: {tenant_id}")
+            print(f"Debug - CLIENT_ID: {client_id}")
+            print(f"Debug - CLIENT_SECRET: {'***' if client_secret else 'None'}")
+            
+            # Configurar el contexto de SharePoint con ClientCredential
             ctx = ClientContext(sharepoint_site).with_credentials(
-                ClientCredential(os.getenv("CLIENT_ID"), os.getenv("CLIENT_SECRET"))
+                ClientCredential(client_id, client_secret)
             )
             
             try:

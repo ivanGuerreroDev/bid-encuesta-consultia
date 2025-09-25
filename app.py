@@ -11,6 +11,16 @@ from collections import defaultdict
 load_dotenv()
 app = Flask(__name__)
 
+# Variable de entorno para modo debug
+DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+# Crear directorio debug_files si el modo debug está activado
+if DEBUG_MODE:
+    debug_dir = os.path.join(os.getcwd(), "debug_files")
+    if not os.path.exists(debug_dir):
+        os.makedirs(debug_dir)
+    print(f"Modo DEBUG activado. Archivos se guardarán en: {debug_dir}")
+
 def get_access_token():
     """Obtener token de acceso usando Client Credentials Flow para Microsoft Graph"""
     tenant_id = os.getenv("TENANT_ID")
@@ -87,6 +97,15 @@ def download_sharepoint_file(access_token, site_id, file_path, temp_dir):
             f.write(file_response.content)
         
         print(f"Debug - Archivo descargado: {local_path}")
+        
+        # Si el modo debug está activado, guardar también una copia en debug_files
+        if DEBUG_MODE:
+            debug_dir = os.path.join(os.getcwd(), "debug_files")
+            debug_path = os.path.join(debug_dir, filename)
+            with open(debug_path, 'wb') as f:
+                f.write(file_response.content)
+            print(f"Debug - Copia guardada en modo debug: {debug_path}")
+        
         return local_path
         
     except Exception as e:
@@ -224,21 +243,111 @@ def generate_excel():
                     print(f"Debug - Renombrada columna '{primera_columna}' a 'ID'")
                 
                 # Procesar los datos
-                df_empresas = process_empresa_data(df_encuesta)
+                empresas = process_empresa_data(df_encuesta)
+                
+                # Calcular secciones_puntaje usando groupby
+                secciones_puntaje = df_puntajes.groupby('Seccion')['Puntaje'].sum().to_dict()
+                
+                # Calcula puntaje por tamaño suma si la fila tiene valor en la columna Pregunta Pequeña o Pregunta Mediana.
+                secciones_puntaje_pequena = defaultdict(int)
+                secciones_puntaje_mediana = defaultdict(int)
+
+                for _, row in df_puntajes.iterrows():
+                    if row['Respuesta Pequeña'] and not pd.isna(row['Respuesta Pequeña']):
+                        secciones_puntaje_pequena[row['Seccion']] += row['Puntaje']
+                    if row['Respuesta Mediana'] and not pd.isna(row['Respuesta Mediana']):
+                        secciones_puntaje_mediana[row['Seccion']] += row['Puntaje']
+                
+                # Preparar resultados
+                resultados = []
+                
+                # Procesar cada respuesta de la encuesta
+                for _, row_encuesta in df_encuesta.iterrows():
+                    id_empresa = row_encuesta['ID']
+                    empresa_info = empresas.get(id_empresa, {})
+                    if not empresa_info.get('Empresa'):
+                        continue
+                    
+                    # Procesar cada respuesta de la fila
+                    for columna, respuesta in row_encuesta.items():
+                        if not isinstance(respuesta, str):
+                            continue
+                            
+                        respuesta_match = re.search(r"\[([A-Za-z0-9_.]+)\]", str(respuesta))
+                        if not respuesta_match:
+                            continue
+                            
+                        respuesta_code = respuesta_match.group(1)
+                        
+                        # Buscar en df_puntajes
+                        puntaje_match = df_puntajes[
+                            (df_puntajes['Respuesta Pequeña'] == respuesta_code) |
+                            (df_puntajes['Respuesta Mediana'] == respuesta_code)
+                        ]
+                        
+                        if not puntaje_match.empty:
+                            tamano = 'Pequeña' if respuesta_code == puntaje_match['Respuesta Pequeña'].iloc[0] else 'Mediana'
+                            seccion = puntaje_match['Seccion'].iloc[0]
+                            
+                            resultados.append({
+                                'ID': id_empresa,
+                                'Empresa': empresa_info.get('Empresa', ''),
+                                'Tamaño': tamano,
+                                'Pais': empresa_info.get('Pais', ''),
+                                'Puntaje': float(puntaje_match['Puntaje'].iloc[0]),
+                                'Seccion': seccion,
+                                'Puntaje Seccion': secciones_puntaje_pequena[seccion] if tamano == 'Pequeña' else secciones_puntaje_mediana[seccion]
+                            })
+                
+                # Crear DataFrame y agrupar resultados
+                if not resultados:
+                    raise ValueError("No se encontraron resultados para procesar")
+                    
+                df_resultados = pd.DataFrame(resultados)
+                
+                # Agrupar resultados por las columnas necesarias y sumar puntajes
+                df_resultados_agrupados = df_resultados.groupby(
+                    ['ID', 'Empresa', 'Tamaño', 'Pais', 'Seccion'],
+                    as_index=False
+                ).agg({
+                    'Puntaje': 'sum',
+                    'Puntaje Seccion': 'first'  # Tomamos el primer valor ya que es el mismo para cada sección
+                })
+
+                # Calcular puntaje total por empresa
+                df_puntaje_total = df_resultados_agrupados.groupby(['ID', 'Empresa'], as_index=False).agg({
+                    'Puntaje': 'sum',
+                    'Puntaje Seccion': 'sum'
+                })
+                # Calcular porcentaje total
+                df_puntaje_total['Porcentaje Total'] = df_puntaje_total['Puntaje'] / df_puntaje_total['Puntaje Seccion']
+                
+                # Calcular puntaje por pais promedia Puntaje
+                df_puntaje_total_pais = df_resultados_agrupados.groupby(['Pais', 'Seccion'], as_index=False).agg({
+                    'Puntaje': 'mean',
+                    'Puntaje Seccion': 'first'
+                })
                 
                 # Crear el archivo Excel final
                 output_path = os.path.join(temp_dir, 'resultado_final.xlsx')
                 output = BytesIO()
                 
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df_empresas_df = pd.DataFrame.from_dict(df_empresas, orient='index').reset_index()
-                    df_empresas_df.columns = ['ID'] + list(df_empresas_df.columns[1:])
-                    df_empresas_df.to_excel(writer, sheet_name='Empresas', index=False)
-                    df_puntajes.to_excel(writer, sheet_name='Puntajes', index=False)
+                    df_resultados_agrupados.to_excel(writer, index=False)
+                    df_puntaje_total[['ID', 'Empresa', 'Porcentaje Total']].to_excel(writer, index=False, sheet_name='General por empresas')
+                    df_puntaje_total_pais.to_excel(writer, index=False, sheet_name='General por paises')
                 
                 # Obtener el contenido del archivo en memoria
                 output.seek(0)
                 file_content = output.getvalue()
+                
+                # Si el modo debug está activado, guardar tabla_radar.xlsx localmente
+                if DEBUG_MODE:
+                    debug_dir = os.path.join(os.getcwd(), "debug_files")
+                    debug_excel_path = os.path.join(debug_dir, "tabla_radar.xlsx")
+                    with open(debug_excel_path, 'wb') as f:
+                        f.write(file_content)
+                    print(f"Debug - tabla_radar.xlsx guardado localmente en: {debug_excel_path}")
                 
                 # Subir archivo a SharePoint usando Microsoft Graph
                 upload_result = upload_sharepoint_file(
@@ -250,8 +359,8 @@ def generate_excel():
                 
                 return jsonify({
                     "message": "Archivo Excel generado y subido exitosamente a SharePoint",
-                    "empresas_procesadas": len(df_empresas),
-                    "total_puntajes": len(df_puntajes),
+                    "empresas_procesadas": len(empresas),
+                    "total_resultados": len(df_resultados_agrupados),
                     "archivo_subido": "tabla_radar.xlsx",
                     "upload_info": upload_result.get('name', 'tabla_radar.xlsx')
                 })

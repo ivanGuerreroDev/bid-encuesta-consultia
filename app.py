@@ -177,7 +177,7 @@ def process_empresa_data(df_encuesta):
     for _, row in df_encuesta.iterrows():
         id_empresa = row['ID']
         if id_empresa not in empresas:
-            empresas[id_empresa] = {'Empresa': '', 'Pais': ''}
+            empresas[id_empresa] = {'Empresa': '', 'Pais': '', 'tamano_empresa': 'Desconocido'}
             
         for columna, valor in row.items():
             if isinstance(columna, str) and isinstance(valor, str):
@@ -189,6 +189,26 @@ def process_empresa_data(df_encuesta):
                     empresas[id_empresa]['Pais'] = 'Costa Rica'
                 elif '[Pg011.02]' in valor:
                     empresas[id_empresa]['Pais'] = 'Panamá'
+                
+                # Procesar tamaño de empresa
+                if empresas[id_empresa]['Pais'] == 'Panamá':
+                    if '[Pa012.01]' in valor:
+                        empresas[id_empresa]['tamano_empresa'] = 'Micro'
+                    elif '[Pa012.02]' in valor:
+                        empresas[id_empresa]['tamano_empresa'] = 'Pequeña'
+                    elif '[Pa012.03]' in valor:
+                        empresas[id_empresa]['tamano_empresa'] = 'Mediana'
+                    elif '[Pa012.04]' in valor or '[Pa012.05]' in valor:
+                        empresas[id_empresa]['tamano_empresa'] = 'Grande'
+                elif empresas[id_empresa]['Pais'] == 'Costa Rica':
+                    if '[Pc012.01]' in valor:
+                        empresas[id_empresa]['tamano_empresa'] = 'Micro'
+                    elif '[Pc012.02]' in valor:
+                        empresas[id_empresa]['tamano_empresa'] = 'Pequeña'
+                    elif '[Pc012.03]' in valor or '[Pc012.04]' in valor:
+                        empresas[id_empresa]['tamano_empresa'] = 'Mediana'
+                    elif '[Pc012.05]' in valor or '[Pc012.06]' in valor:
+                        empresas[id_empresa]['tamano_empresa'] = 'Grande'
             
     return empresas
 
@@ -293,6 +313,7 @@ def generate_excel():
                                 'ID': id_empresa,
                                 'Empresa': empresa_info.get('Empresa', ''),
                                 'Tamaño': tamano,
+                                'Tamaño de empresa': empresa_info.get('tamano_empresa', 'Desconocido'),
                                 'Pais': empresa_info.get('Pais', ''),
                                 'Puntaje': float(puntaje_match['Puntaje'].iloc[0]),
                                 'Seccion': seccion,
@@ -307,7 +328,7 @@ def generate_excel():
                 
                 # Agrupar resultados por las columnas necesarias y sumar puntajes
                 df_resultados_agrupados = df_resultados.groupby(
-                    ['ID', 'Empresa', 'Tamaño', 'Pais', 'Seccion'],
+                    ['ID', 'Empresa', 'Tamaño', 'Pais', 'Seccion', 'Tamaño de empresa'],
                     as_index=False
                 ).agg({
                     'Puntaje': 'sum',
